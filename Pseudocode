@@ -1,0 +1,631 @@
+from _future_ import annotations
+from dataclasses import dataclass, field
+from fractions import Fraction
+from typing import List, Optional
+
+
+# ============================
+# 1. MODEL DATA
+# ============================
+
+@dataclass
+class Heir:
+    """
+    Satu kelompok ahli waris.
+    - relation       : hubungan (mis. 'husband', 'mother', 'son', dst.)
+    - count          : jumlah orang dalam kelompok
+    - kind           : 'sharer' (dzawil furudh) atau 'residuary' (ashabah)
+    - share_fraction : bagian kelompok dari total harta (1 = 100%)
+    """
+    relation: str
+    count: int = 1
+    kind: str = "sharer"
+    share_fraction: Fraction = field(default_factory=lambda: Fraction(0, 1))
+
+    @property
+    def share_per_person(self) -> Fraction:
+        if self.count <= 0:
+            return Fraction(0, 1)
+        return self.share_fraction / self.count
+
+
+@dataclass
+class InheritanceCase:
+    """
+    Satu kasus waris:
+    - estate_value : total harta (rupiah, dll.)
+    - heirs        : daftar Heir
+    - trace        : jejak langkah (explainable)
+    """
+    estate_value: int
+    heirs: List[Heir]
+    trace: List[str] = field(default_factory=list)
+
+    def log(self, msg: str) -> None:
+        self.trace.append(msg)
+
+    def get_heir(self, relation: str) -> Optional[Heir]:
+        for h in self.heirs:
+            if h.relation == relation:
+                return h
+        return None
+
+    def any_relation(self, relations: List[str]) -> bool:
+        return any(h.relation in relations for h in self.heirs)
+
+    def count_relations(self, relations: List[str]) -> int:
+        return sum(h.count for h in self.heirs if h.relation in relations)
+
+    def total_fraction(self) -> Fraction:
+        return sum(h.share_fraction for h in self.heirs)
+
+
+# ============================
+# 2. KALKULATOR FARAIDH (Syafi'i, ringkas)
+# ============================
+
+class InheritanceCalculator:
+    """
+    Kalkulator faraidh yang:
+    - exception-aware (Umariyyatayn, Musytarakah, Akdariyya; Awl; Radd)
+    - explainable (menulis trace keputusan)
+    Basis aturan: Syafi'i (ringkas/versi prototipe).
+    """
+
+    def _init_(self, include_spouse_in_radd: bool = False):
+        # Syafi'i: pasangan (suami/istri) TIDAK ikut radd (default False)
+        self.include_spouse_in_radd = include_spouse_in_radd
+
+    # ---------- API UTAMA ----------
+
+    def compute(self, case: InheritanceCase) -> None:
+        """
+        Alur:
+        1) Reset
+        2) Aturan dasar (furudh + penetapan kandidat ashabah)
+        3) Kasus khusus (Umariyyatayn, Musytarakah, Akdariyya)
+        4) Awl (jika total > 1)
+        5) Distribusi sisa ke ashabah (jika ada)
+        6) Radd (jika total < 1 dan tidak ada ashabah)
+        """
+        case.trace.clear()
+        self._reset_shares(case)
+
+        # Kasus khusus (dievaluasi lebih awal agar trace tidak tercampur aturan dasar)
+        if self._handle_umariyyatayn(case):
+            return
+
+        if self._handle_musytarakah(case):
+            return
+
+        if self._handle_akdariyya(case):
+            return
+
+        # Aturan dasar (furudh + penetapan kandidat ashabah)
+        self._assign_base_shares_syafii(case)
+
+        # Normal flow
+        self._handle_awl(case)
+        self._assign_residuaries_from_remainder(case)
+        self._handle_radd(case)
+
+    # ============================
+    # 2A. ATURAN DASAR (Syafi'i ringkas)
+    # ============================
+
+    def _assign_base_shares_syafii(self, case: InheritanceCase) -> None:
+        """
+        Aturan dasar (ringkas, Syafi'i):
+        - Suami: 1/2 (tanpa anak) ; 1/4 (dengan anak)
+        - Istri: 1/4 (tanpa anak) ; 1/8 (dengan anak)
+        - Ibu:  1/3 (tanpa anak dan saudara <2) ; 1/6 (ada anak atau saudara >=2)
+        - Ayah:
+            * ada anak: 1/6, dan jika tidak ada anak laki-laki maka ayah mengambil sisa (ashabah)
+            * tidak ada anak: ayah ashabah (ambil sisa)
+        - Anak:
+            * jika ada anak laki-laki: anak-anak ashabah 2:1
+            * jika hanya anak perempuan: 1 orang 1/2; >=2 orang 2/3 (sharer)
+        - Saudara seibu (uterine):
+            hanya jika tidak ada anak dan tidak ada ayah:
+            1 orang 1/6; >=2 orang 1/3 dibagi rata per kepala
+        - Saudara kandung (full):
+            (versi prototipe) jadi ashabah jika tidak ada anak dan tidak ada ayah.
+        """
+        has_child = case.any_relation(["son", "daughter", "son_son", "daughter_son"])
+        case.log(f"Deteksi keturunan (anak/cucu): {'ada' if has_child else 'tidak ada'}.")
+
+        husband = case.get_heir("husband")
+        wife = case.get_heir("wife")
+        mother = case.get_heir("mother")
+        father = case.get_heir("father")
+
+        sons = case.get_heir("son")
+        daughters = case.get_heir("daughter")
+
+        # --- Suami / Istri ---
+        if husband:
+            husband.kind = "sharer"
+            husband.share_fraction = Fraction(1, 4) if has_child else Fraction(1, 2)
+            case.log(f"Suami mendapat {'1/4' if has_child else '1/2'} (furudh).")
+        if wife:
+            wife.kind = "sharer"
+            wife.share_fraction = Fraction(1, 8) if has_child else Fraction(1, 4)
+            case.log(f"Istri mendapat {'1/8' if has_child else '1/4'} (furudh).")
+
+        # --- Ibu (Syafi'i: saudara harus >=2 untuk menurunkan ke 1/6) ---
+        if mother:
+            mother.kind = "sharer"
+            sibling_groups = ["full_brother", "full_sister", "uterine_brother", "uterine_sister"]
+            sibling_count = case.count_relations(sibling_groups)
+            case.log(f"Jumlah saudara (untuk aturan ibu): {sibling_count}.")
+            if has_child or sibling_count >= 2:
+                mother.share_fraction = Fraction(1, 6)
+                case.log("Ibu mendapat 1/6 (karena ada anak atau saudara >=2).")
+            else:
+                mother.share_fraction = Fraction(1, 3)
+                case.log("Ibu mendapat 1/3 (tidak ada anak dan saudara <2).")
+
+        # --- Ayah ---
+        if father:
+            if has_child:
+                father.share_fraction = Fraction(1, 6)
+                # Jika tidak ada anak laki-laki (hanya anak perempuan), ayah mengambil sisa sebagai ashabah
+                if not (sons and sons.count > 0):
+                    father.kind = "residuary"
+                    case.log("Ayah mendapat 1/6 dan berhak atas sisa (karena tidak ada anak laki-laki).")
+                else:
+                    father.kind = "sharer"
+                    case.log("Ayah mendapat 1/6 (ada anak laki-laki, sisa untuk anak).")
+            else:
+                father.kind = "residuary"
+                case.log("Ayah menjadi ashabah (tidak ada anak).")
+
+        # --- Saudara seibu (uterine) ---
+        uterine_sibs = [h for h in case.heirs if h.relation in ("uterine_brother", "uterine_sister")]
+        if uterine_sibs and not has_child and not father:
+            n_uterine = sum(h.count for h in uterine_sibs)
+            if n_uterine == 1:
+                uterine_sibs[0].kind = "sharer"
+                uterine_sibs[0].share_fraction = Fraction(1, 6)
+                case.log("Saudara seibu tunggal mendapat 1/6 (furudh).")
+            else:
+                total = Fraction(1, 3)
+                per_head = total / n_uterine
+                for g in uterine_sibs:
+                    g.kind = "sharer"
+                    g.share_fraction = per_head * g.count
+                case.log("Saudara seibu (>=2) mendapat 1/3 dibagi rata per kepala (furudh).")
+
+        # --- Anak ---
+        # 1) Jika ada anak laki-laki: anak-anak ashabah 2:1 atas sisa
+        if sons and sons.count > 0:
+            # Daughters ikut sebagai ashabah jika ada son
+            if daughters and daughters.count > 0:
+                daughters.kind = "residuary"
+            sons.kind = "residuary"
+            case.log("Anak-anak menjadi ashabah (rasio 2:1) karena ada anak laki-laki.")
+            # Distribusi dilakukan setelah awl, pada tahap assign_residuaries_from_remainder.
+        else:
+            # 2) Hanya anak perempuan: sharer 1/2 atau 2/3
+            if daughters and daughters.count > 0:
+                daughters.kind = "sharer"
+                if daughters.count == 1:
+                    daughters.share_fraction = Fraction(1, 2)
+                    case.log("Anak perempuan tunggal mendapat 1/2 (furudh).")
+                else:
+                    daughters.share_fraction = Fraction(2, 3)
+                    case.log("Anak perempuan >=2 mendapat 2/3 (furudh).")
+
+        # --- Saudara kandung (Syafi'i ringkas) ---
+        # Kondisi: tidak ada anak/cucu dan tidak ada ayah.
+        # 1) Jika ada saudara kandung laki-laki (full_brother), maka saudara kandung menjadi ashabah (2:1 bila campur).
+        # 2) Jika tidak ada full_brother, tetapi ada full_sister:
+        #    - 1 orang full_sister → 1/2 (furudh)
+        #    - >=2 full_sister → 2/3 (furudh)
+        if not has_child and not father:
+            full_bro = case.get_heir("full_brother")
+            full_sis = case.get_heir("full_sister")
+
+            if full_bro and full_bro.count > 0:
+                full_bro.kind = "residuary"
+                if full_sis and full_sis.count > 0:
+                    full_sis.kind = "residuary"
+                case.log("Saudara kandung ditetapkan sebagai ashabah (karena ada full_brother, tanpa anak dan ayah).")
+
+            elif full_sis and full_sis.count > 0:
+                full_sis.kind = "sharer"
+                if full_sis.count == 1:
+                    full_sis.share_fraction = Fraction(1, 2)
+                    case.log("Saudari kandung tunggal mendapat 1/2 (furudh), tanpa anak dan ayah.")
+                else:
+                    full_sis.share_fraction = Fraction(2, 3)
+                    case.log("Saudari kandung >=2 mendapat 2/3 (furudh), tanpa anak dan ayah.")
+
+    # ============================
+    # 2B. KASUS KHUSUS
+    # ============================
+
+
+    def _handle_umariyyatayn(self, case: InheritanceCase) -> bool:
+        """
+        Umariyyatayn (Syafi'i):
+        - Suami + Ibu + Ayah (tanpa anak/cucu)
+        - Istri + Ibu + Ayah (tanpa anak/cucu)
+        Aturan: pasangan mendapat furudh; ibu mendapat 1/3 dari sisa; ayah mendapat sisa.
+        Catatan: prototipe ini mensyaratkan hanya 3 kelompok ahli waris tersebut yang ada.
+        """
+        father = case.get_heir("father")
+        mother = case.get_heir("mother")
+        husband = case.get_heir("husband")
+        wife = case.get_heir("wife")
+
+        if not (father and mother):
+            return False
+        if case.any_relation(["son", "daughter", "son_son", "daughter_son"]):
+            return False
+        if len(case.heirs) != 3:
+            return False
+        if not (husband or wife):
+            return False
+
+        # Trace bersih: hanya aturan khusus yang dipakai
+        case.trace.clear()
+        self._reset_shares(case)
+
+        if husband:
+            husband.kind = "sharer"
+            husband.share_fraction = Fraction(1, 2)
+            spouse_label = "Suami"
+            spouse_share = husband.share_fraction
+        else:
+            wife.kind = "sharer"
+            wife.share_fraction = Fraction(1, 4)
+            spouse_label = "Istri"
+            spouse_share = wife.share_fraction
+
+        remainder = Fraction(1, 1) - spouse_share
+        mother.kind = "sharer"
+        mother.share_fraction = remainder * Fraction(1, 3)
+
+        father.kind = "residuary"
+        father.share_fraction = Fraction(1, 1) - spouse_share - mother.share_fraction
+
+        case.log("Deteksi keturunan (anak/cucu): tidak ada.")
+        case.log(f"{spouse_label} mendapat {spouse_share} (furudh).")
+        case.log("Ibu mendapat 1/3 dari sisa (Umariyyatayn).")
+        case.log("Ayah mendapat sisa (ashabah).")
+        case.log("Kasus khusus terdeteksi: Umariyyatayn (override aturan dasar).")
+        return True
+
+
+    def _handle_musytarakah(self, case: InheritanceCase) -> bool:
+        """
+        Musytarakah (Umar's case / al-musyarakah):
+        Pola deteksi (versi prototipe):
+        - Suami
+        - Ibu
+        - >=2 saudara seibu (uterine brother/sister)
+        - >=1 saudari kandung (full sister)
+        Tanpa ayah dan tanpa anak/cucu.
+
+        Kaidah ringkas:
+        - Suami: 1/2
+        - Ibu: 1/6 (karena saudara >=2)
+        - Sisa 1/3 dibagi per kepala untuk seluruh saudara (seibu + kandung), tanpa membedakan jenis.
+        """
+        husband = case.get_heir("husband")
+        mother = case.get_heir("mother")
+        father = case.get_heir("father")
+
+        if not (husband and mother):
+            return False
+        if father:
+            return False
+        if case.any_relation(["son", "daughter", "son_son", "daughter_son"]):
+            return False
+
+        uterine_bro = case.get_heir("uterine_brother")
+        uterine_sis = case.get_heir("uterine_sister")
+        full_sis = case.get_heir("full_sister")
+
+        uterine_count = (uterine_bro.count if uterine_bro else 0) + (uterine_sis.count if uterine_sis else 0)
+        if uterine_count < 2:
+            return False
+        if not (full_sis and full_sis.count >= 1):
+            return False
+
+        # Trace bersih: hanya aturan khusus yang dipakai
+        case.trace.clear()
+        self._reset_shares(case)
+
+        husband.kind = "sharer"
+        husband.share_fraction = Fraction(1, 2)
+
+        mother.kind = "sharer"
+        mother.share_fraction = Fraction(1, 6)
+
+        siblings_pool = Fraction(1, 1) - husband.share_fraction - mother.share_fraction  # = 1/3
+
+        total_heads = uterine_count + full_sis.count
+        per_head = siblings_pool / total_heads
+
+        if uterine_bro:
+            uterine_bro.kind = "sharer"
+            uterine_bro.share_fraction = per_head * uterine_bro.count
+        if uterine_sis:
+            uterine_sis.kind = "sharer"
+            uterine_sis.share_fraction = per_head * uterine_sis.count
+
+        full_sis.kind = "sharer"
+        full_sis.share_fraction = per_head * full_sis.count
+
+        case.log("Deteksi keturunan (anak/cucu): tidak ada.")
+        case.log("Ayah: tidak ada (syarat Musytarakah).")
+        case.log("Suami mendapat 1/2 (furudh).")
+        case.log("Ibu mendapat 1/6 (karena saudara >=2).")
+        case.log("Sisa 1/3 dibagi per kepala kepada seluruh saudara (seibu + kandung).")
+        case.log("Kasus khusus terdeteksi: Musytarakah (override aturan dasar).")
+        return True
+
+
+    def _handle_akdariyya(self, case: InheritanceCase) -> bool:
+        """
+        Kasus al-Akdariyya (Syafi'i):
+        Pewaris: suami + ibu + kakek (jalur ayah) + 1 saudari kandung.
+        Distribusi menurut mazhab Syafi'i:
+        - Suami : 9/27 (1/3)
+        - Ibu   : 6/27 (2/9)
+        - Kakek : 8/27
+        - Saudari kandung : 4/27
+        """
+        husband = case.get_heir("husband")
+        mother = case.get_heir("mother")
+        pgf = case.get_heir("paternal_grandfather")  # kakek dari jalur ayah
+        full_sis = case.get_heir("full_sister")
+
+        # Syarat minimal: keempat-empatnya ada
+        if not (husband and mother and pgf and full_sis):
+            return False
+
+        # Tidak boleh ada ayah atau keturunan (anak/cucu)
+        if case.any_relation(["father", "son", "daughter", "son_son", "daughter_son"]):
+            return False
+
+        # Versi prototipe: persis 4 kelompok ahli waris ini saja
+        if len(case.heirs) != 4:
+            return False
+
+        # Bersihkan trace & share karena ini override total
+        case.trace.clear()
+        self._reset_shares(case)
+
+        # Set jenis (di sini ditandai sebagai sharer karena sudah fixed)
+        husband.kind = "sharer"
+        mother.kind = "sharer"
+        pgf.kind = "sharer"
+        full_sis.kind = "sharer"
+
+        # Set pecahan sesuai hasil al-Akdariyya
+        husband.share_fraction = Fraction(9, 27)   # 1/3
+        mother.share_fraction = Fraction(6, 27)    # 2/9
+        pgf.share_fraction = Fraction(8, 27)
+        full_sis.share_fraction = Fraction(4, 27)
+
+        case.log("Kasus khusus terdeteksi: al-Akdariyya (suami, ibu, kakek, saudari kandung).")
+        case.log("Bagian ditetapkan: suami 9/27, ibu 6/27, kakek 8/27, saudari kandung 4/27 (mazhab Syafi'i).")
+        return True
+
+    def _handle_awl(self, case: InheritanceCase) -> None:
+        """
+        Jika total furudh > 1 → semua bagian diperkecil proporsional (awl).
+        """
+        total = case.total_fraction()
+        if total > Fraction(1, 1):
+            case.log(f"Total furudh = {total} > 1 → terapkan 'awl (normalisasi).")
+            for h in case.heirs:
+                if h.share_fraction > 0:
+                    h.share_fraction = h.share_fraction / total
+
+    def _assign_residuaries_from_remainder(self, case: InheritanceCase) -> None:
+        """
+        Jika ada ashabah, berikan sisa kepada ashabah sesuai prioritas sederhana:
+        1) Anak (jika ada son)
+        2) Ayah (jika ditandai residuary)
+        3) Saudara kandung (jika ditandai residuary)
+        """
+        remainder = Fraction(1, 1) - case.total_fraction()
+        if remainder <= 0:
+            return
+
+        sons = case.get_heir("son")
+        daughters = case.get_heir("daughter")
+
+        # 1) Anak-anak ashabah 2:1 jika ada son
+        if sons and sons.count > 0 and sons.kind == "residuary":
+            dcount = daughters.count if (daughters and daughters.count > 0) else 0
+            unit = remainder / (2 * sons.count + dcount)
+            sons.share_fraction += (2 * sons.count * unit)
+            if daughters and dcount > 0:
+                daughters.kind = "residuary"
+                daughters.share_fraction += (dcount * unit)
+            case.log("Sisa dibagikan kepada anak-anak (ashabah 2:1).")
+            return
+
+        # 2) Ayah ashabah (mis. hanya anak perempuan atau tanpa anak)
+        father = case.get_heir("father")
+        if father and father.kind == "residuary":
+            father.share_fraction += remainder
+            case.log("Sisa diberikan kepada ayah sebagai ashabah.")
+            return
+
+        # 3) Saudara kandung ashabah (prototipe) 2:1
+        full_bro = case.get_heir("full_brother")
+        full_sis = case.get_heir("full_sister")
+        if (full_bro and full_bro.kind == "residuary") or (full_sis and full_sis.kind == "residuary"):
+            b = full_bro.count if full_bro else 0
+            s = full_sis.count if full_sis else 0
+            if b + s > 0:
+                if b > 0 and s > 0:
+                    unit = remainder / (2 * b + s)
+                    full_bro.share_fraction += (2 * b * unit)
+                    full_sis.share_fraction += (s * unit)
+                elif b > 0:
+                    full_bro.share_fraction += remainder
+                else:
+                    full_sis.share_fraction += remainder
+                case.log("Sisa diberikan kepada saudara kandung sebagai ashabah (2:1 bila campur).")
+                return
+
+    def _handle_radd(self, case: InheritanceCase) -> None:
+        """
+        Jika total < 1 dan tidak ada ashabah → sisa dikembalikan ke dzawil furudh (radd).
+        Syafi'i: pasangan tidak ikut radd (default).
+        """
+        total = case.total_fraction()
+        if total >= Fraction(1, 1):
+            return
+
+        # Jika masih ada ashabah (meski share 0), radd tidak dilakukan—sisa untuk ashabah
+        if any(h.kind == "residuary" for h in case.heirs):
+            # Jika residuary ada tapi belum dapat apa-apa, assign_residuaries_from_remainder seharusnya sudah menangani.
+            return
+
+        def eligible_for_radd(h: Heir) -> bool:
+            if h.share_fraction == 0:
+                return False
+            if h.kind != "sharer":
+                return False
+            if (not self.include_spouse_in_radd) and (h.relation in ("husband", "wife")):
+                return False
+            return True
+
+        eligible = [h for h in case.heirs if eligible_for_radd(h)]
+        if not eligible:
+            return
+
+        sum_eligible = sum(h.share_fraction for h in eligible)
+        if sum_eligible <= 0:
+            return
+
+        remainder = Fraction(1, 1) - total
+        factor = (sum_eligible + remainder) / sum_eligible
+        for h in eligible:
+            h.share_fraction *= factor
+
+        case.log("Radd diterapkan: sisa dikembalikan ke sharers (pasangan dikecualikan).")
+
+    # ============================
+    # UTIL
+    # ============================
+
+    @staticmethod
+    def _reset_shares(case: InheritanceCase) -> None:
+        for h in case.heirs:
+            h.share_fraction = Fraction(0, 1)
+
+
+# ============================
+# 3. CETAK HASIL
+# ============================
+
+def print_result(case: InheritanceCase) -> None:
+    print("=== Hasil Perhitungan Waris ===")
+    print(f"Total harta: {case.estate_value:,}")
+    print()
+    total_fraction = case.total_fraction()
+    print(f"Total pecahan yang terbagi: {float(total_fraction):.6f} (target 1.0)")
+    print()
+
+    for h in case.heirs:
+        if h.share_fraction == 0:
+            continue
+        frac = h.share_fraction
+        per_person_frac = h.share_per_person
+        total_amount = case.estate_value * float(frac)
+        per_person_amount = case.estate_value * float(per_person_frac)
+
+        print(f"- {h.relation} (jumlah {h.count})")
+        print(f"  Bagian kelompok : {frac} (~ {float(frac):.6f})")
+        print(f"  Bagian per orang: {per_person_frac} (~ {float(per_person_frac):.6f})")
+        print(f"  Nilai kelompok  : Rp{total_amount:,.0f}")
+        print(f"  Nilai per orang : Rp{per_person_amount:,.0f}")
+        print()
+
+    if case.trace:
+        print("Trace (explainable steps):")
+        for i, t in enumerate(case.trace, 1):
+            print(f"  {i}. {t}")
+        print()
+
+
+# ============================
+# 4. CONTOH PEMAKAIAN
+# ============================
+
+if _name_ == "_main_":
+    calc = InheritanceCalculator()
+
+    # Contoh 1: Umariyyatayn (Suami + Ibu + Ayah)
+    case1 = InheritanceCase(
+        estate_value=600_000_000,
+        heirs=[Heir("husband", 1), Heir("mother", 1), Heir("father", 1)]
+    )
+    calc.compute(case1)
+    print("Contoh Umariyyatayn (Husband + Mother + Father):")
+    print_result(case1)
+
+    # Contoh 2: Musytarakah (Suami + Ibu + 2 saudara seibu + 1 saudari kandung)
+    case2 = InheritanceCase(
+        estate_value=300_000_000,
+        heirs=[Heir("husband", 1), Heir("mother", 1), Heir("uterine_brother", 2), Heir("full_sister", 1)]
+    )
+    calc.compute(case2)
+    print("\nContoh Musytarakah (Umar's case):")
+    print_result(case2)
+
+    # Contoh 3: Keluarga dengan anak (Suami + Ibu + 2 anak laki + 1 anak perempuan)
+    case3 = InheritanceCase(
+        estate_value=1_000_000_000,
+        heirs=[Heir("husband", 1), Heir("mother", 1), Heir("son", 2), Heir("daughter", 1)]
+    )
+    calc.compute(case3)
+    print("\nContoh keluarga dengan anak (suami, ibu, 2 anak laki, 1 anak perempuan):")
+    print_result(case3)
+
+    # Contoh 4: 'Awl (Suami + Ibu + 2 Saudari kandung)
+    case4 = InheritanceCase(
+        estate_value=480_000_000,
+        heirs=[Heir("husband", 1), Heir("mother", 1), Heir("full_sister", 2)]
+    )
+    calc.compute(case4)
+    print("\nContoh 'Awl (Husband + Mother + 2 Full Sisters):")
+    print_result(case4)
+
+    # Contoh 5: Radd (Suami + 1 Anak Perempuan)
+    case5 = InheritanceCase(
+        estate_value=400_000_000,
+        heirs=[Heir("husband", 1), Heir("daughter", 1)]
+    )
+    calc.compute(case5)
+    print("\nContoh Radd (Husband + 1 Daughter):")
+    print_result(case5)
+
+# ===============================================================
+# Contoh Kasus al-Akdariyya (Syafi'i)
+# (Husband + Mother + Paternal Grandfather + 1 Full Sister)
+# ===============================================================
+
+print("\nContoh al-Akdariyya (Husband + Mother + Paternal Grandfather + 1 Full Sister):")
+
+case_akdariyya = InheritanceCase(
+    estate_value=10_000_000,
+    heirs=[
+        Heir("husband", 1),
+        Heir("mother", 1),
+        Heir("paternal_grandfather", 1),  # kakek dari jalur ayah (جدّ)
+        Heir("full_sister", 1),
+    ],
+)
+
+calc.compute(case_akdariyya)
+print_result(case_akdariyya)
